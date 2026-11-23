@@ -16,11 +16,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Download repository
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. Extract project ZIP
       - name: Extract AAKNOVA Project
         id: locate
         shell: bash
@@ -30,20 +28,18 @@ jobs:
           ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" -print -quit)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: Project ZIP not found in repository root."
+            echo "ERROR: Project ZIP not found."
             exit 1
           fi
 
           mkdir -p "$RUNNER_TEMP/aaknova"
           unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/aaknova"
 
-          CONFIG=$(find "$RUNNER_TEMP/aaknova" \
-            -type f \
+          CONFIG=$(find "$RUNNER_TEMP/aaknova" -type f \
             \( -name "capacitor.config.ts" \
             -o -name "capacitor.config.json" \
             -o -name "capacitor.config.js" \) \
-            -not -path "*/node_modules/*" \
-            -print -quit)
+            -not -path "*/node_modules/*" -print -quit)
 
           if [ -z "$CONFIG" ]; then
             echo "ERROR: Capacitor configuration not found."
@@ -53,59 +49,43 @@ jobs:
           PROJECT_DIR=$(dirname "$CONFIG")
 
           if [ ! -f "$PROJECT_DIR/package.json" ]; then
-            echo "ERROR: package.json not found beside Capacitor config."
+            echo "ERROR: package.json not found."
             exit 1
           fi
 
-          echo "Project directory: $PROJECT_DIR"
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
-      # 3. Setup Node.js
+      # Fixed: npm cache disabled to avoid missing lockfile error
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: ${{ steps.locate.outputs.project_dir }}/package-lock.json
 
-      # 4. Fix Vite and esbuild compatibility
       - name: Fix Dependencies
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
           set -euo pipefail
-
           npm pkg set "devDependencies.esbuild=^0.28.2"
+          npm install --no-audit --no-fund
 
-          if [ -f package-lock.json ]; then
-            npm install --no-audit --no-fund
-          else
-            npm install --no-audit --no-fund
-          fi
-
-      # 5. Verify dependencies
       - name: Verify Vite and esbuild
         working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: |
-          npm ls vite esbuild
+        run: npm ls vite esbuild
 
-      # 6. Build web application
       - name: Build Web Application
         working-directory: ${{ steps.locate.outputs.project_dir }}
         run: npm run build
 
-      # 7. Setup Java
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # 8. Setup Android SDK
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      # 9. Verify Android project
       - name: Verify Android Project
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
@@ -119,42 +99,36 @@ jobs:
 
           if [ ! -f android/app/build.gradle ] && \
              [ ! -f android/app/build.gradle.kts ]; then
-            echo "ERROR: Android app Gradle file not found."
+            echo "ERROR: Android Gradle file not found."
             exit 1
           fi
 
-      # 10. Capacitor sync
       - name: Sync Capacitor Android
         working-directory: ${{ steps.locate.outputs.project_dir }}
         run: npx cap sync android
 
-      # 11. Build APK
       - name: Build Debug APK
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
           set -euo pipefail
-
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
 
-      # 12. Check APK
       - name: Verify APK
         working-directory: ${{ steps.locate.outputs.project_dir }}
         run: |
           set -euo pipefail
-
           APK="android/app/build/outputs/apk/debug/app-debug.apk"
 
           if [ ! -f "$APK" ]; then
-            echo "ERROR: APK file was not generated."
+            echo "ERROR: APK was not generated."
             exit 1
           fi
 
           ls -lh "$APK"
 
-      # 13. Upload APK
       - name: Upload AAKNOVA APK
         uses: actions/upload-artifact@v4
         with:
