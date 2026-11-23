@@ -31,11 +31,9 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # Android SDK and licenses are handled here.
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
-          cmdline-tools-version: '15859902'
           accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: false
           packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
@@ -99,11 +97,9 @@ jobs:
           p.dependencies ||= {};
           p.devDependencies ||= {};
 
-          // Fix Vite 8 and esbuild peer dependency conflict.
           p.devDependencies.esbuild = '^0.28.2';
           p.devDependencies.typescript = '5.9.3';
 
-          // Capacitor Android dependencies.
           p.dependencies['@capacitor/core'] = '6.2.1';
           p.dependencies['@capacitor/android'] = '6.2.1';
           p.devDependencies['@capacitor/cli'] = '6.2.1';
@@ -113,7 +109,7 @@ jobs:
             JSON.stringify(p, null, 2) + '\n'
           );
 
-          console.log('Dependency versions updated.');
+          console.log('Dependencies updated.');
           NODE
 
       - name: Install Dependencies
@@ -131,8 +127,9 @@ jobs:
         run: |
           set -e
 
-          # Use JSON config to avoid the previous TypeScript config parser error.
-          rm -f capacitor.config.ts capacitor.config.js capacitor.config.cjs
+          rm -f capacitor.config.ts
+          rm -f capacitor.config.js
+          rm -f capacitor.config.cjs
 
           cat > capacitor.config.json <<'EOF'
           {
@@ -142,34 +139,47 @@ jobs:
           }
           EOF
 
-          echo "Capacitor configuration created."
+          echo "Capacitor configuration ready."
 
       - name: Build Web Application
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
+
           npm run build
 
-          test -d dist || {
-            echo "ERROR: dist folder was not generated."
+          if [ ! -d dist ]; then
+            echo "ERROR: dist folder not generated."
             exit 1
-          }
+          fi
 
-          echo "Web build successful."
+          echo "Web application built successfully."
 
-      - name: Create Android Project If Missing
+      - name: Repair Android Project And Generate Gradle Wrapper
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
 
-          if [ ! -d android ]; then
+          if [ ! -f android/gradlew ]; then
+            echo "Gradle wrapper missing."
+
+            if [ -d android ]; then
+              echo "Removing incomplete Android project."
+              rm -rf android
+            fi
+
+            echo "Generating fresh Android project."
             npx cap add android
+          else
+            echo "Existing Android Gradle wrapper found."
           fi
 
           if [ ! -f android/gradlew ]; then
-            echo "ERROR: Android Gradle wrapper not found."
+            echo "ERROR: Gradle wrapper generation failed."
             exit 1
           fi
+
+          echo "Gradle wrapper successfully generated."
 
       - name: Sync Capacitor
         working-directory: ${{ env.PROJECT_DIR }}
@@ -177,18 +187,34 @@ jobs:
           set -e
           npx cap sync android
 
+      - name: Verify Android Project
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+
+          test -f android/gradlew
+          test -f android/settings.gradle || \
+          test -f android/settings.gradle.kts
+
+          test -d android/app
+
+          echo "Android project verification successful."
+
       - name: Build Debug APK
         working-directory: ${{ env.PROJECT_DIR }}/android
         run: |
           set -e
+
           chmod +x gradlew
 
           ./gradlew assembleDebug --no-daemon
 
-          test -f app/build/outputs/apk/debug/app-debug.apk || {
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -f "$APK" ]; then
             echo "ERROR: APK was not generated."
             exit 1
-          }
+          fi
 
           echo "AAKNOVA APK BUILD SUCCESSFUL."
 
