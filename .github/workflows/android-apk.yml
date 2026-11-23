@@ -31,6 +31,14 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
       - name: Extract AAKNOVA ZIP
         run: |
           set -e
@@ -38,58 +46,90 @@ jobs:
           ZIP_FILE=$(find . -maxdepth 1 -type f -name '*.zip' | head -n 1)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: ZIP file not found in repository."
+            echo "ERROR: ZIP file not found."
             exit 1
           fi
-
-          echo "Found ZIP: $ZIP_FILE"
 
           mkdir -p _aaknova_unpacked
           unzip -q "$ZIP_FILE" -d _aaknova_unpacked
 
           echo "ZIP extracted successfully."
 
-      - name: Find AAKNOVA Project Folder
+      - name: Find Project Folder
         run: |
           set -e
 
           PROJECT_DIR=""
 
-          while IFS= read -r PACKAGE_FILE; do
-            DIR=$(dirname "$PACKAGE_FILE")
+          while IFS= read -r FILE; do
+            DIR=$(dirname "$FILE")
 
-            if [ -f "$DIR/capacitor.config.ts" ] || \
-               [ -f "$DIR/capacitor.config.js" ] || \
-               [ -f "$DIR/capacitor.config.json" ]; then
+            if [ -f "$DIR/vite.config.ts" ] || \
+               [ -f "$DIR/vite.config.js" ] || \
+               [ -f "$DIR/vite.config.mjs" ]; then
               PROJECT_DIR="$DIR"
               break
             fi
-          done < <(find _aaknova_unpacked -type f -name package.json \
+          done < <(find _aaknova_unpacked -type f \
+            -name package.json \
             -not -path '*/node_modules/*' | sort)
 
           if [ -z "$PROJECT_DIR" ]; then
-            PACKAGE_FILE=$(find _aaknova_unpacked -type f \
-              -name package.json -not -path '*/node_modules/*' \
-              | head -n 1)
-
-            if [ -n "$PACKAGE_FILE" ]; then
-              PROJECT_DIR=$(dirname "$PACKAGE_FILE")
-            fi
-          fi
-
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: package.json not found inside ZIP."
+            echo "ERROR: Vite project folder not found."
             find _aaknova_unpacked -maxdepth 4 -type f | head -n 100
             exit 1
           fi
 
           PROJECT_DIR=$(realpath "$PROJECT_DIR")
-
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-          echo "AAKNOVA project folder:"
-          echo "$PROJECT_DIR"
+          echo "Project found: $PROJECT_DIR"
           ls -la "$PROJECT_DIR"
+
+      - name: Repair Project Dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+
+          node <<'NODE'
+          const fs = require('fs');
+          const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+
+          p.dependencies ||= {};
+          p.devDependencies ||= {};
+
+          // Vite 8 peer dependency compatibility
+          p.devDependencies.esbuild = '^0.28.2';
+          p.devDependencies.typescript = '5.9.3';
+
+          // Capacitor Android dependencies
+          p.dependencies['@capacitor/core'] = '6.2.1';
+          p.dependencies['@capacitor/android'] = '6.2.1';
+          p.devDependencies['@capacitor/cli'] = '6.2.1';
+
+          // Add react-is matching the installed React major version
+          const reactVersion =
+            p.dependencies.react ||
+            p.devDependencies.react ||
+            '^18.0.0';
+
+          const match = String(reactVersion).match(/[0-9]+/);
+          const reactMajor = match ? Number(match[0]) : 18;
+
+          p.dependencies['react-is'] = `^${reactMajor}.0.0`;
+
+          fs.writeFileSync(
+            'package.json',
+            JSON.stringify(p, null, 2) + '\n'
+          );
+
+          console.log('Updated package.json dependencies.');
+          console.log('esbuild:', p.devDependencies.esbuild);
+          console.log('Capacitor:', p.dependencies['@capacitor/core']);
+          console.log('react-is:', p.dependencies['react-is']);
+          NODE
+
+          echo "Dependency repair complete."
 
       - name: Install Dependencies
         working-directory: ${{ env.PROJECT_DIR }}
@@ -97,35 +137,54 @@ jobs:
           set -e
           npm install --no-audit --no-fund
 
-      - name: Fix TypeScript Compatibility
+          echo "Installed versions:"
+          npm ls vite esbuild typescript @capacitor/core @capacitor/cli @capacitor/android --depth=0
+
+      - name: Configure Capacitor
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
-          npm install --no-save --package-lock=false typescript@5.9.3
-          npx tsc --version
 
-      - name: Build Web App
+          # Avoid the previous TypeScript config parsing error.
+          rm -f capacitor.config.ts capacitor.config.js capacitor.config.cjs
+
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.aaknova.enterprise",
+            "appName": "AAKNOVA",
+            "webDir": "dist"
+          }
+          EOF
+
+          echo "Capacitor JSON configuration created."
+
+      - name: Build Web Application
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
           npm run build
 
-      - name: Check Android Project
+          if [ ! -d dist ]; then
+            echo "ERROR: dist folder was not generated."
+            exit 1
+          fi
+
+          echo "Web build successful."
+
+      - name: Create Android Project If Missing
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
 
           if [ ! -d android ]; then
-            echo "ERROR: Android folder is missing from the project."
-            exit 1
+            npx cap add android
           fi
 
-          if [ ! -f android/gradlew ]; then
-            echo "ERROR: android/gradlew not found."
+          if [ ! -f android/settings.gradle ] && \
+             [ ! -f android/settings.gradle.kts ]; then
+            echo "ERROR: Android Gradle project is incomplete."
             exit 1
           fi
-
-          echo "Android project found."
 
       - name: Sync Capacitor
         working-directory: ${{ env.PROJECT_DIR }}
@@ -133,14 +192,40 @@ jobs:
           set -e
           npx cap sync android
 
-      - name: Build APK
+      - name: Prepare Android SDK
+        run: |
+          yes | sdkmanager --licenses
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+      - name: Prepare Gradle Wrapper
         working-directory: ${{ env.PROJECT_DIR }}/android
         run: |
           set -e
+
+          if [ ! -f gradlew ]; then
+            gradle wrapper --gradle-version 8.7
+          fi
+
           chmod +x gradlew
+
+      - name: Build Debug APK
+        working-directory: ${{ env.PROJECT_DIR }}/android
+        run: |
+          set -e
           ./gradlew assembleDebug --no-daemon
 
-      - name: Upload APK
+          if [ ! -f app/build/outputs/apk/debug/app-debug.apk ]; then
+            echo "ERROR: APK file was not generated."
+            exit 1
+          fi
+
+          echo "APK BUILD SUCCESSFUL."
+
+      - name: Upload AAKNOVA APK
         uses: actions/upload-artifact@v4
         with:
           name: AAKNOVA-APK
