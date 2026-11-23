@@ -1,1 +1,306 @@
 
+name: AAKNOVA Android APK Build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '*.zip'
+      - '**/*.zip'
+      - '.github/workflows/android-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build AAKNOVA Debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '12266719'
+          packages: ''
+          accept-android-sdk-licenses: false
+          log-accepted-android-sdk-licenses: false
+
+      - name: Accept licenses and install Android packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          command -v sdkmanager
+          set +o pipefail
+          yes | sdkmanager --licenses
+          set -o pipefail
+          sdkmanager \
+            'platform-tools' \
+            'platforms;android-34' \
+            'build-tools;34.0.0'
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_ROOT"
+          test -d "$SDK_ROOT/platforms/android-34"
+          test -x "$SDK_ROOT/build-tools/34.0.0/apksigner"
+
+      - name: Find and extract AAKNOVA ZIP
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mapfile -t ROOT_ZIPS < <(
+            find . -maxdepth 3 -type f -iname '*.zip' \
+              ! -path './.git/*' \
+              ! -path './extracted/*' | sort
+          )
+
+          if [ "${#ROOT_ZIPS[@]}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one AAKNOVA project ZIP."
+            printf 'Found: %s\n' "${ROOT_ZIPS[@]}"
+            exit 1
+          fi
+
+          rm -rf extracted
+          mkdir -p extracted
+          unzip -oq "${ROOT_ZIPS[0]}" -d extracted
+
+          PROJECT_DIR=''
+
+          for depth in 1 2 3; do
+            mapfile -t PROJECTS < <(
+              find extracted -type f -name package.json \
+                ! -path '*/node_modules/*' \
+                ! -path '*/android/*' | sort
+            )
+
+            if [ "${#PROJECTS[@]}" -eq 1 ]; then
+              PROJECT_DIR="$(dirname "${PROJECTS[0]}")"
+              break
+            fi
+
+            if [ "${#PROJECTS[@]}" -gt 1 ]; then
+              echo "ERROR: Multiple project package.json files found."
+              printf '%s\n' "${PROJECTS[@]}"
+              exit 1
+            fi
+
+            mapfile -t NESTED_ZIPS < <(
+              find extracted -type f -iname '*.zip' \
+                ! -path '*/node_modules/*' | sort
+            )
+
+            if [ "${#NESTED_ZIPS[@]}" -eq 0 ]; then
+              echo "ERROR: No project package.json or nested ZIP found."
+              find extracted -maxdepth 5 -type f | sort | head -200
+              exit 1
+            fi
+
+            for archive in "${NESTED_ZIPS[@]}"; do
+              destination="extracted/unpacked-${depth}-$(basename "${archive%.zip}")"
+              mkdir -p "$destination"
+              unzip -oq "$archive" -d "$destination"
+            done
+          done
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: Could not locate the AAKNOVA project."
+            exit 1
+          fi
+
+          test -s "$PROJECT_DIR/package.json"
+          test -s "$PROJECT_DIR/vite.config.ts"
+          test -s "$PROJECT_DIR/src/main.tsx"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project found: $PROJECT_DIR"
+
+      - name: Validate package and install dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const all = {
+            ...pkg.dependencies,
+            ...pkg.devDependencies
+          };
+
+          if (!pkg.scripts?.build) {
+            throw new Error('Missing scripts.build in package.json');
+          }
+
+          for (const name of ['react', 'react-dom', 'vite', '@vitejs/plugin-react']) {
+            if (!all[name]) {
+              throw new Error(`Missing dependency: ${name}`);
+            }
+          }
+
+          console.log('Package validation passed.');
+          NODE
+
+          npm install --no-audit --no-fund --legacy-peer-deps
+
+          npm install --save-exact --legacy-peer-deps --no-audit --no-fund \
+            @capacitor/core@6.2.1 \
+            @capacitor/cli@6.2.1 \
+            @capacitor/android@6.2.1 \
+            react-is@19.3.1
+
+      - name: Verify Capacitor versions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+
+          for package in core cli android; do
+            version="$(node -p "require('./node_modules/@capacitor/$package/package.json').version")"
+            echo "@capacitor/$package: $version"
+            test "$version" = '6.2.1'
+          done
+
+      - name: Configure Capacitor
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ -f capacitor.config.ts ]; then
+            mv capacitor.config.ts capacitor.config.ts.source-backup
+          fi
+
+          rm -f capacitor.config.js capacitor.config.mjs capacitor.config.cjs
+
+          cat > capacitor.config.json <<'JSON'
+          {
+            "appId": "com.aaknova.enterprise",
+            "appName": "AAKNOVA",
+            "webDir": "dist",
+            "server": {
+              "androidScheme": "https"
+            }
+          }
+          JSON
+
+          node -e "JSON.parse(require('node:fs').readFileSync('capacitor.config.json','utf8')); console.log('Capacitor config valid');"
+
+      - name: Build web application
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+          npm run build
+          test -s dist/index.html
+          echo "Web build verified."
+
+      - name: Generate Android project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ -d android ]; then
+            rm -rf android-uploaded
+            mv android android-uploaded
+          fi
+
+          npx cap add android
+
+          if [ -d android-uploaded/app/src/main ]; then
+            cp -a android-uploaded/app/src/main/. android/app/src/main/
+          fi
+
+          npx cap sync android
+
+          test -s android/gradlew
+          test -s android/gradle/wrapper/gradle-wrapper.jar
+          test -s android/gradle/wrapper/gradle-wrapper.properties
+          test -s android/capacitor.settings.gradle
+          test -s android/app/capacitor.build.gradle
+          test -s android/app/src/main/AndroidManifest.xml
+
+          chmod +x android/gradlew
+
+      - name: Verify Android build versions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR/android"
+
+          AGP_VERSION="$(
+            grep -Eo 'com\.android\.tools\.build:gradle:[0-9.]+' build.gradle |
+            sed -n '1p' | awk -F: '{print $3}'
+          )"
+
+          GRADLE_URL="$(
+            grep '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties |
+            cut -d= -f2-
+          )"
+
+          COMPILE_SDK="$(
+            grep -Eo 'compileSdkVersion[[:space:]]*=[[:space:]]*[0-9]+' variables.gradle |
+            sed -n '1p' | grep -Eo '[0-9]+$'
+          )"
+
+          echo "AGP: $AGP_VERSION"
+          echo "Gradle: $GRADLE_URL"
+          echo "Compile SDK: $COMPILE_SDK"
+
+          test "$AGP_VERSION" = '8.2.1'
+          [[ "$GRADLE_URL" == *'gradle-8.2.1-'* ]]
+          test "$COMPILE_SDK" = '34'
+
+      - name: Verify Java and Gradle
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR/android"
+          java -version
+          ./gradlew --version
+          ./gradlew --no-daemon --version | grep -q 'JVM:.*17'
+
+      - name: Build and verify APK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR/android"
+
+          ./gradlew --no-daemon --stacktrace clean assembleDebug
+
+          APK='app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$APK"
+
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose "$APK"
+
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp "$APK" "$GITHUB_WORKSPACE/output/AAKNOVA.apk"
+
+          test -s "$GITHUB_WORKSPACE/output/AAKNOVA.apk"
+          ls -lh "$GITHUB_WORKSPACE/output/AAKNOVA.apk"
+
+      - name: Upload AAKNOVA APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AAKNOVA-Android-APK
+          path: output/AAKNOVA.apk
+          if-no-files-found: error
+          retention-days: 14
+          
