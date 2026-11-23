@@ -8,7 +8,6 @@ on:
       - main
     paths:
       - '**'
-      - '!README.md'
 
 permissions:
   contents: read
@@ -25,8 +24,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
+          node-version: '20'
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -34,13 +32,18 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Check Project Files
+        run: |
+          echo "Checking project files..."
+          ls -la
+          test -f package.json || {
+            echo "ERROR: package.json not found"
+            exit 1
+          }
+
       - name: Install Dependencies
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+          npm install --no-audit --no-fund
 
       - name: Fix TypeScript Compatibility
         run: |
@@ -50,32 +53,29 @@ jobs:
       - name: Build Web App
         run: npm run build
 
-      - name: Check Capacitor Configuration
+      - name: Check Capacitor
         run: |
-          if [ -f capacitor.config.ts ]; then
-            echo "TypeScript Capacitor config found"
-          elif [ -f capacitor.config.js ]; then
-            echo "JavaScript Capacitor config found"
-          elif [ -f capacitor.config.json ]; then
-            echo "JSON Capacitor config found"
-          else
-            echo "ERROR: Capacitor config not found"
+          npx cap --version
+          test -f capacitor.config.ts || \
+          test -f capacitor.config.js || \
+          test -f capacitor.config.json || {
+            echo "ERROR: Capacitor configuration missing"
             exit 1
-          fi
+          }
 
-      - name: Sync Capacitor Android
+      - name: Sync Capacitor
         run: npx cap sync android
 
-      - name: Build Android APK
+      - name: Build APK
         working-directory: android
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
 
-      - name: Upload AAKNOVA APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: AAKNOVA-Android-APK
+          name: AAKNOVA-APK
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
