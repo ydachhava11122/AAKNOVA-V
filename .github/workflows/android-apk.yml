@@ -12,48 +12,92 @@ permissions:
 
 jobs:
   build:
-    name: Build AAKNOVA
+    name: Build AAKNOVA APK
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Locate Project ZIP
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE=$(find . -maxdepth 1 -iname "*.zip" -print -quit)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: Project ZIP not found"
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/aaknova"
+
+          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/aaknova"
+
+          CONFIG=$(find "$RUNNER_TEMP/aaknova" \
+            -type f \
+            \( -name "capacitor.config.ts" \
+            -o -name "capacitor.config.json" \
+            -o -name "capacitor.config.js" \) \
+            -not -path "*/node_modules/*" \
+            -print -quit)
+
+          if [ -z "$CONFIG" ]; then
+            echo "ERROR: Capacitor config not found"
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$CONFIG")
+
+          if [ ! -f "$PROJECT_DIR/package.json" ]; then
+            echo "ERROR: package.json missing"
+            exit 1
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-
-      - name: Check Project Files
-        run: |
-          test -f package.json
-          test -f package-lock.json
-          test -f capacitor.config.ts -o -f capacitor.config.json -o -f capacitor.config.js
+          node-version: '20'
 
       - name: Install Dependencies
-        run: npm ci
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
 
-      - name: Build Application
+      - name: Build Web App
+        working-directory: ${{ steps.locate.outputs.project_dir }}
         run: npm run build
 
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: '17'
 
-      - name: Setup Android SDK
+      - name: Setup Android
         uses: android-actions/setup-android@v3
 
-      - name: Check Android Project
+      - name: Verify Android
+        working-directory: ${{ steps.locate.outputs.project_dir }}
         run: |
           test -f android/gradlew
-          test -f android/app/build.gradle -o -f android/app/build.gradle.kts
+          test -f android/app/build.gradle || \
+          test -f android/app/build.gradle.kts
 
       - name: Sync Capacitor
+        working-directory: ${{ steps.locate.outputs.project_dir }}
         run: npx cap sync android
 
-      - name: Build Debug APK
+      - name: Build APK
+        working-directory: ${{ steps.locate.outputs.project_dir }}
         run: |
           cd android
           chmod +x gradlew
@@ -63,7 +107,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: AAKNOVA-APK
-          path: android/app/build/outputs/apk/debug/*.apk
+          path: ${{ steps.locate.outputs.project_dir }}/android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 7
           
