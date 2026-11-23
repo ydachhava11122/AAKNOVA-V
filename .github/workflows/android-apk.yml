@@ -4,10 +4,11 @@ name: AAKNOVA Android APK Build
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     paths:
-      - '*.zip'
-      - '**/*.zip'
-      - '.github/workflows/android-apk.yml'
+      - '**'
+      - '!README.md'
 
 permissions:
   contents: read
@@ -24,382 +25,58 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: 20
+          cache: npm
 
-      - name: Setup Java 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: 'platform-tools'
-
-      - name: Accept Android SDK Licenses
-        shell: bash
+      - name: Install Dependencies
         run: |
-          set -e
-
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager | sort -V | tail -n 1)"
-
-          if [ -z "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager not found"
-            exit 1
-          fi
-
-          set +o pipefail
-          yes | "$SDKMANAGER" --licenses
-          set -o pipefail
-
-      - name: Install Android SDK Packages
-        shell: bash
-        run: |
-          set -e
-
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager | sort -V | tail -n 1)"
-
-          "$SDKMANAGER" \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
-
-      - name: Extract AAKNOVA ZIP
-        shell: bash
-        run: |
-          set -e
-
-          mapfile -t ZIP_FILES < <(
-            find . -maxdepth 3 -type f -name '*.zip' \
-              ! -path './.git/*' | sort
-          )
-
-          if [ "${#ZIP_FILES[@]}" -ne 1 ]; then
-            echo "ERROR: Exactly one ZIP file is required."
-            echo "Found: ${#ZIP_FILES[@]}"
-            printf '%s\n' "${ZIP_FILES[@]}"
-            exit 1
-          fi
-
-          mkdir -p "$GITHUB_WORKSPACE/_aaknova_unpacked"
-
-          unzip -q "${ZIP_FILES[0]}" \
-            -d "$GITHUB_WORKSPACE/_aaknova_unpacked"
-
-          echo "ZIP extracted successfully."
-
-      - name: Find AAKNOVA React Project
-        shell: bash
-        run: |
-          set -e
-
-          PROJECT=""
-
-          while IFS= read -r -d '' PACKAGE_FILE; do
-            CANDIDATE="$(dirname "$PACKAGE_FILE")"
-
-            if [ -f "$CANDIDATE/vite.config.ts" ] && \
-               [ -f "$CANDIDATE/src/main.tsx" ]; then
-              PROJECT="$CANDIDATE"
-              break
-            fi
-          done < <(
-            find "$GITHUB_WORKSPACE/_aaknova_unpacked" \
-              -type f -name package.json \
-              ! -path '*/node_modules/*' -print0
-          )
-
-          if [ -z "$PROJECT" ]; then
-            echo "ERROR: React/Vite project not found."
-            echo "Expected package.json, vite.config.ts and src/main.tsx."
-            exit 1
-          fi
-
-          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
-          echo "Project found: $PROJECT"
-
-      - name: Install Project Dependencies
-        shell: bash
-        run: |
-          set -e
-          cd "$PROJECT_DIR"
-
-          echo "Checking Vite and esbuild compatibility..."
-
-          npm pkg set 'devDependencies.esbuild=^0.28.2'
-
-          npm install --legacy-peer-deps
-
-          npm install --no-save --legacy-peer-deps \
-            @capacitor/core@6.2.1 \
-            @capacitor/cli@6.2.1 \
-            @capacitor/android@6.2.1 \
-            react-is@19.3.1 \
-            esbuild@^0.28.2
-
-          echo "Installed esbuild version:"
-          npm ls esbuild
-
-      - name: Configure Capacitor
-        shell: bash
-        run: |
-          set -e
-          cd "$PROJECT_DIR"
-
-          cat > capacitor.config.json <<'EOF'
-          {
-            "appId": "com.aaknova.enterprise",
-            "appName": "AAKNOVA",
-            "webDir": "dist",
-            "server": {
-              "androidScheme": "https"
-            }
-          }
-          EOF
-
-      - name: Build Web Application
-        shell: bash
-        run: |
-          set -e
-          cd "$PROJECT_DIR"
-
-          npm run build
-
-          if [ ! -d dist ]; then
-            echo "ERROR: dist folder was not generated."
-            exit 1
-          fi
-
-          echo "Web application build completed."
-
-      - name: Prepare Existing Android Resources
-        shell: bash
-        run: |
-          set -e
-          cd "$PROJECT_DIR"
-
-          rm -rf android-uploaded
-
-          if [ -d android ]; then
-            mv android android-uploaded
-            echo "Existing Android project backed up."
+          if [ -f package-lock.json ]; then
+            npm ci
           else
-            echo "No existing Android folder found."
+            npm install
           fi
 
-      - name: Generate Capacitor Android Project
-        shell: bash
+      - name: Fix TypeScript Compatibility
         run: |
-          set -e
-          cd "$PROJECT_DIR"
+          npm install --no-save --package-lock=false typescript@5.9.3
+          npx tsc --version
 
-          npx cap add android
+      - name: Build Web App
+        run: npm run build
 
-      - name: Merge Existing Android Resources Safely
-        shell: bash
+      - name: Check Capacitor Configuration
         run: |
-          set -e
-          cd "$PROJECT_DIR"
-
-          if [ ! -d android-uploaded/app/src/main/res ]; then
-            echo "No old Android resources to merge."
-            exit 0
+          if [ -f capacitor.config.ts ]; then
+            echo "TypeScript Capacitor config found"
+          elif [ -f capacitor.config.js ]; then
+            echo "JavaScript Capacitor config found"
+          elif [ -f capacitor.config.json ]; then
+            echo "JSON Capacitor config found"
+          else
+            echo "ERROR: Capacitor config not found"
+            exit 1
           fi
-
-          python3 - <<'PY'
-          import os
-          import shutil
-          from pathlib import Path
-
-          source = Path("android-uploaded/app/src/main/res")
-          target = Path("android/app/src/main/res")
-
-          if not source.exists() or not target.exists():
-              print("Resource folder missing.")
-              raise SystemExit(0)
-
-          copied = 0
-          skipped = 0
-
-          priority = {
-              ".png": 0,
-              ".webp": 1,
-              ".jpg": 2,
-              ".jpeg": 3,
-              ".xml": 4
-          }
-
-          for root, dirs, files in os.walk(source):
-              dirs[:] = sorted(
-                  d for d in dirs if not d.startswith("values")
-              )
-
-              current = Path(root)
-              relative = current.relative_to(source)
-
-              if any(
-                  part.startswith("values")
-                  for part in relative.parts
-              ):
-                  continue
-
-              destination_dir = target / relative
-              destination_dir.mkdir(
-                  parents=True,
-                  exist_ok=True
-              )
-
-              existing_stems = {
-                  p.stem
-                  for p in destination_dir.iterdir()
-                  if p.is_file()
-              }
-
-              ordered_files = sorted(
-                  files,
-                  key=lambda name: (
-                      priority.get(
-                          Path(name).suffix.lower(), 10
-                      ),
-                      name
-                  )
-              )
-
-              for filename in ordered_files:
-                  src = current / filename
-                  dst = destination_dir / filename
-
-                  if dst.exists() or src.stem in existing_stems:
-                      skipped += 1
-                      print(f"Skipped conflicting resource: {src}")
-                      continue
-
-                  shutil.copy2(src, dst)
-                  existing_stems.add(src.stem)
-                  copied += 1
-
-          print(f"Resources copied: {copied}")
-          print(f"Resources skipped: {skipped}")
-          PY
-
-      - name: Check Duplicate Android Resources
-        shell: bash
-        run: |
-          set -e
-          cd "$PROJECT_DIR"
-
-          python3 - <<'PY'
-          from pathlib import Path
-          from collections import defaultdict
-
-          root = Path("android/app/src/main/res")
-          errors = []
-
-          for folder in root.iterdir():
-              if (
-                  not folder.is_dir()
-                  or folder.name.startswith("values")
-              ):
-                  continue
-
-              groups = defaultdict(list)
-
-              for file in folder.iterdir():
-                  if file.is_file():
-                      groups[file.stem].append(file.name)
-
-              for stem, names in groups.items():
-                  if len(names) > 1:
-                      errors.append(
-                          f"{folder}: duplicate '{stem}': {names}"
-                      )
-
-          if errors:
-              print("\n".join(errors))
-              raise SystemExit("Duplicate resources detected.")
-
-          print("No duplicate resources found.")
-          PY
 
       - name: Sync Capacitor Android
-        shell: bash
-        run: |
-          set -e
-          cd "$PROJECT_DIR"
-
-          npx cap sync android
-
-      - name: Check Android Build Configuration
-        shell: bash
-        run: |
-          set -e
-          cd "$PROJECT_DIR/android"
-
-          echo "Java version:"
-          java -version
-
-          echo "Gradle wrapper:"
-          cat gradle/wrapper/gradle-wrapper.properties
-
-          echo "Android Gradle Plugin:"
-          grep -R "com.android.tools.build:gradle" \
-            build.gradle build.gradle.kts \
-            2>/dev/null || true
-
-          echo "Compile SDK:"
-          grep -R "compileSdk" \
-            app/build.gradle \
-            app/build.gradle.kts \
-            2>/dev/null || true
+        run: npx cap sync android
 
       - name: Build Android APK
-        shell: bash
+        working-directory: android
         run: |
-          set -e
-          cd "$PROJECT_DIR/android"
-
           chmod +x gradlew
-
-          ./gradlew --no-daemon --stacktrace \
-            clean assembleDebug
-
-      - name: Verify APK
-        shell: bash
-        run: |
-          set -e
-          cd "$PROJECT_DIR"
-
-          APK="android/app/build/outputs/apk/debug/app-debug.apk"
-
-          if [ ! -f "$APK" ]; then
-            echo "ERROR: APK file not found."
-            exit 1
-          fi
-
-          APKSIGNER="$ANDROID_HOME/build-tools/34.0.0/apksigner"
-
-          if [ ! -f "$APKSIGNER" ]; then
-            echo "ERROR: apksigner not found."
-            exit 1
-          fi
-
-          "$APKSIGNER" verify --verbose "$APK"
-
-          mkdir -p "$GITHUB_WORKSPACE/AAKNOVA-APK"
-
-          cp "$APK" \
-            "$GITHUB_WORKSPACE/AAKNOVA-APK/AAKNOVA.apk"
-
-          echo "APK successfully verified."
+          ./gradlew assembleDebug --no-daemon
 
       - name: Upload AAKNOVA APK
         uses: actions/upload-artifact@v4
         with:
           name: AAKNOVA-Android-APK
-          path: AAKNOVA-APK/AAKNOVA.apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
           
