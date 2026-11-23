@@ -16,9 +16,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Checkout
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # 2. Extract Project ZIP
       - name: Extract AAKNOVA Project
         id: locate
         shell: bash
@@ -33,16 +35,18 @@ jobs:
           fi
 
           mkdir -p "$RUNNER_TEMP/aaknova"
+
           unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/aaknova"
 
           CONFIG=$(find "$RUNNER_TEMP/aaknova" -type f \
             \( -name "capacitor.config.ts" \
             -o -name "capacitor.config.json" \
             -o -name "capacitor.config.js" \) \
-            -not -path "*/node_modules/*" -print -quit)
+            -not -path "*/node_modules/*" \
+            -print -quit)
 
           if [ -z "$CONFIG" ]; then
-            echo "ERROR: Capacitor configuration not found."
+            echo "ERROR: Capacitor config not found."
             exit 1
           fi
 
@@ -53,39 +57,72 @@ jobs:
             exit 1
           fi
 
+          echo "Project directory: $PROJECT_DIR"
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
-      # Fixed: npm cache disabled to avoid missing lockfile error
+      # 3. Setup Node
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      - name: Fix Dependencies
+      # 4. Install Dependencies
+      - name: Install Dependencies
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
           set -euo pipefail
+
           npm pkg set "devDependencies.esbuild=^0.28.2"
+
           npm install --no-audit --no-fund
 
-      - name: Verify Vite and esbuild
+      # 5. Verify Dependencies
+      - name: Verify Dependencies
         working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: npm ls vite esbuild
+        run: |
+          npm ls vite esbuild
 
+      # 6. Build Web App
       - name: Build Web Application
         working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: npm run build
+        run: |
+          npm run build
 
+      # 7. Setup Java
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # 8. Configure Existing Android SDK
+      - name: Configure Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
 
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
+          if [ -z "$SDK" ] || [ ! -d "$SDK" ]; then
+            echo "ERROR: Android SDK not found."
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+
+          if [ ! -x "$SDK/platform-tools/adb" ]; then
+            echo "ERROR: Android platform-tools not found."
+            exit 1
+          fi
+
+          echo "Android SDK configured."
+          adb version
+
+      # 9. Verify Android Project
       - name: Verify Android Project
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
@@ -103,23 +140,34 @@ jobs:
             exit 1
           fi
 
+          echo "Android project verified."
+
+      # 10. Sync Capacitor
       - name: Sync Capacitor Android
         working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: npx cap sync android
+        run: |
+          npx cap sync android
 
+      # 11. Build APK
       - name: Build Debug APK
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
           set -euo pipefail
+
           cd android
+
           chmod +x gradlew
+
           ./gradlew assembleDebug --no-daemon
 
+      # 12. Verify APK
       - name: Verify APK
         working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
         run: |
           set -euo pipefail
+
           APK="android/app/build/outputs/apk/debug/app-debug.apk"
 
           if [ ! -f "$APK" ]; then
@@ -127,8 +175,10 @@ jobs:
             exit 1
           fi
 
+          echo "APK successfully generated:"
           ls -lh "$APK"
 
+      # 13. Upload APK
       - name: Upload AAKNOVA APK
         uses: actions/upload-artifact@v4
         with:
