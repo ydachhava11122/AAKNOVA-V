@@ -37,22 +37,20 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           cmdline-tools-version: '12266719'
-          packages: ''
-          accept-android-sdk-licenses: false
-          log-accepted-android-sdk-licenses: false
 
       - name: Accept licenses and install Android packages
         shell: bash
         run: |
           set -Eeuo pipefail
-          command -v sdkmanager
           set +o pipefail
           yes | sdkmanager --licenses
           set -o pipefail
+
           sdkmanager \
             'platform-tools' \
             'platforms;android-34' \
             'build-tools;34.0.0'
+
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
           test -n "$SDK_ROOT"
           test -d "$SDK_ROOT/platforms/android-34"
@@ -71,7 +69,7 @@ jobs:
 
           if [ "${#ROOT_ZIPS[@]}" -ne 1 ]; then
             echo "ERROR: Expected exactly one AAKNOVA project ZIP."
-            printf 'Found: %s\n' "${ROOT_ZIPS[@]}"
+            printf '%s\n' "${ROOT_ZIPS[@]}"
             exit 1
           fi
 
@@ -106,7 +104,6 @@ jobs:
 
             if [ "${#NESTED_ZIPS[@]}" -eq 0 ]; then
               echo "ERROR: No project package.json or nested ZIP found."
-              find extracted -maxdepth 5 -type f | sort | head -200
               exit 1
             fi
 
@@ -118,7 +115,7 @@ jobs:
           done
 
           if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: Could not locate the AAKNOVA project."
+            echo "ERROR: Could not locate AAKNOVA project."
             exit 1
           fi
 
@@ -145,10 +142,15 @@ jobs:
           };
 
           if (!pkg.scripts?.build) {
-            throw new Error('Missing scripts.build in package.json');
+            throw new Error('Missing scripts.build');
           }
 
-          for (const name of ['react', 'react-dom', 'vite', '@vitejs/plugin-react']) {
+          for (const name of [
+            'react',
+            'react-dom',
+            'vite',
+            '@vitejs/plugin-react'
+          ]) {
             if (!all[name]) {
               throw new Error(`Missing dependency: ${name}`);
             }
@@ -207,25 +209,84 @@ jobs:
         run: |
           set -Eeuo pipefail
           cd "$PROJECT_DIR"
+
           npm run build
+
           test -s dist/index.html
           echo "Web build verified."
 
-      - name: Generate Android project
+      - name: Generate Android project safely
         shell: bash
         run: |
           set -Eeuo pipefail
           cd "$PROJECT_DIR"
 
           if [ -d android ]; then
-            rm -rf android-uploaded
             mv android android-uploaded
           fi
 
           npx cap add android
 
-          if [ -d android-uploaded/app/src/main ]; then
-            cp -a android-uploaded/app/src/main/. android/app/src/main/
+          # Copy only missing Android resources.
+          # Never overwrite newly generated Capacitor resources.
+          if [ -d android-uploaded/app/src/main/res ]; then
+            python3 <<'PY'
+          from pathlib import Path
+          import shutil
+
+          source = Path("android-uploaded/app/src/main/res")
+          target = Path("android/app/src/main/res")
+
+          copied = 0
+          skipped = 0
+          seen = set()
+
+          files = sorted(
+              (p for p in source.rglob("*") if p.is_file()),
+              key=lambda p: (
+                  0 if p.suffix.lower() == ".png" else 1,
+                  str(p)
+              )
+          )
+
+          for src in files:
+              relative = src.relative_to(source)
+              dest = target / relative
+
+              # Resource identity: directory + filename without extension.
+              resource_key = (
+                  str(relative.parent),
+                  relative.stem.lower()
+              )
+
+              if resource_key in seen:
+                  print(f"SKIP duplicate old resource: {relative}")
+                  skipped += 1
+                  continue
+
+              seen.add(resource_key)
+
+              if dest.exists():
+                  print(f"KEEP generated resource: {relative}")
+                  skipped += 1
+                  continue
+
+              # Avoid conflicts with another generated extension.
+              if any(
+                  p.is_file() and p.stem.lower() == relative.stem.lower()
+                  for p in dest.parent.glob(relative.stem + ".*")
+              ):
+                  print(f"SKIP conflicting resource: {relative}")
+                  skipped += 1
+                  continue
+
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(src, dest)
+              print(f"COPIED: {relative}")
+              copied += 1
+
+          print(f"Resource merge complete: {copied} copied, {skipped} skipped.")
+          PY
           fi
 
           npx cap sync android
@@ -238,6 +299,46 @@ jobs:
           test -s android/app/src/main/AndroidManifest.xml
 
           chmod +x android/gradlew
+
+      - name: Check duplicate Android resources
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR/android/app/src/main/res"
+
+          python3 <<'PY'
+          from pathlib import Path
+          import sys
+
+          root = Path(".")
+          resources = {}
+
+          for file in root.rglob("*"):
+              if not file.is_file():
+                  continue
+
+              if file.parent.name.startswith("values"):
+                  continue
+
+              key = (
+                  str(file.parent),
+                  file.stem.lower()
+              )
+
+              resources.setdefault(key, []).append(file)
+
+          errors = [
+              files for files in resources.values()
+              if len(files) > 1
+          ]
+
+          if errors:
+              for group in errors:
+                  print("DUPLICATE:", *group)
+              sys.exit("ERROR: Duplicate Android resources found.")
+
+          print("Android resource duplicate check passed.")
+          PY
 
       - name: Verify Android build versions
         shell: bash
@@ -273,8 +374,10 @@ jobs:
         run: |
           set -Eeuo pipefail
           cd "$PROJECT_DIR/android"
+
           java -version
           ./gradlew --version
+
           ./gradlew --no-daemon --version | grep -q 'JVM:.*17'
 
       - name: Build and verify APK
@@ -288,9 +391,11 @@ jobs:
           APK='app/build/outputs/apk/debug/app-debug.apk'
           test -s "$APK"
 
-          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose "$APK"
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" \
+            verify --verbose "$APK"
 
           mkdir -p "$GITHUB_WORKSPACE/output"
+
           cp "$APK" "$GITHUB_WORKSPACE/output/AAKNOVA.apk"
 
           test -s "$GITHUB_WORKSPACE/output/AAKNOVA.apk"
