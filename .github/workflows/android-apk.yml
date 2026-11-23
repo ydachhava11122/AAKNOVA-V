@@ -31,13 +31,14 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # Android SDK and licenses are handled here.
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: android-actions/setup-android@v4
         with:
-          gradle-version: '8.7'
+          cmdline-tools-version: '15859902'
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
 
       - name: Extract AAKNOVA ZIP
         run: |
@@ -83,10 +84,10 @@ jobs:
           PROJECT_DIR=$(realpath "$PROJECT_DIR")
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-          echo "Project found: $PROJECT_DIR"
+          echo "Project folder: $PROJECT_DIR"
           ls -la "$PROJECT_DIR"
 
-      - name: Repair Project Dependencies
+      - name: Repair Dependencies
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
@@ -98,38 +99,22 @@ jobs:
           p.dependencies ||= {};
           p.devDependencies ||= {};
 
-          // Vite 8 peer dependency compatibility
+          // Fix Vite 8 and esbuild peer dependency conflict.
           p.devDependencies.esbuild = '^0.28.2';
           p.devDependencies.typescript = '5.9.3';
 
-          // Capacitor Android dependencies
+          // Capacitor Android dependencies.
           p.dependencies['@capacitor/core'] = '6.2.1';
           p.dependencies['@capacitor/android'] = '6.2.1';
           p.devDependencies['@capacitor/cli'] = '6.2.1';
-
-          // Add react-is matching the installed React major version
-          const reactVersion =
-            p.dependencies.react ||
-            p.devDependencies.react ||
-            '^18.0.0';
-
-          const match = String(reactVersion).match(/[0-9]+/);
-          const reactMajor = match ? Number(match[0]) : 18;
-
-          p.dependencies['react-is'] = `^${reactMajor}.0.0`;
 
           fs.writeFileSync(
             'package.json',
             JSON.stringify(p, null, 2) + '\n'
           );
 
-          console.log('Updated package.json dependencies.');
-          console.log('esbuild:', p.devDependencies.esbuild);
-          console.log('Capacitor:', p.dependencies['@capacitor/core']);
-          console.log('react-is:', p.dependencies['react-is']);
+          console.log('Dependency versions updated.');
           NODE
-
-          echo "Dependency repair complete."
 
       - name: Install Dependencies
         working-directory: ${{ env.PROJECT_DIR }}
@@ -137,15 +122,16 @@ jobs:
           set -e
           npm install --no-audit --no-fund
 
-          echo "Installed versions:"
-          npm ls vite esbuild typescript @capacitor/core @capacitor/cli @capacitor/android --depth=0
+          npm ls vite esbuild typescript \
+            @capacitor/core @capacitor/cli @capacitor/android \
+            --depth=0
 
       - name: Configure Capacitor
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
 
-          # Avoid the previous TypeScript config parsing error.
+          # Use JSON config to avoid the previous TypeScript config parser error.
           rm -f capacitor.config.ts capacitor.config.js capacitor.config.cjs
 
           cat > capacitor.config.json <<'EOF'
@@ -156,7 +142,7 @@ jobs:
           }
           EOF
 
-          echo "Capacitor JSON configuration created."
+          echo "Capacitor configuration created."
 
       - name: Build Web Application
         working-directory: ${{ env.PROJECT_DIR }}
@@ -164,10 +150,10 @@ jobs:
           set -e
           npm run build
 
-          if [ ! -d dist ]; then
+          test -d dist || {
             echo "ERROR: dist folder was not generated."
             exit 1
-          fi
+          }
 
           echo "Web build successful."
 
@@ -180,9 +166,8 @@ jobs:
             npx cap add android
           fi
 
-          if [ ! -f android/settings.gradle ] && \
-             [ ! -f android/settings.gradle.kts ]; then
-            echo "ERROR: Android Gradle project is incomplete."
+          if [ ! -f android/gradlew ]; then
+            echo "ERROR: Android Gradle wrapper not found."
             exit 1
           fi
 
@@ -192,40 +177,22 @@ jobs:
           set -e
           npx cap sync android
 
-      - name: Prepare Android SDK
-        run: |
-          yes | sdkmanager --licenses
-
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
-
-      - name: Prepare Gradle Wrapper
-        working-directory: ${{ env.PROJECT_DIR }}/android
-        run: |
-          set -e
-
-          if [ ! -f gradlew ]; then
-            gradle wrapper --gradle-version 8.7
-          fi
-
-          chmod +x gradlew
-
       - name: Build Debug APK
         working-directory: ${{ env.PROJECT_DIR }}/android
         run: |
           set -e
+          chmod +x gradlew
+
           ./gradlew assembleDebug --no-daemon
 
-          if [ ! -f app/build/outputs/apk/debug/app-debug.apk ]; then
-            echo "ERROR: APK file was not generated."
+          test -f app/build/outputs/apk/debug/app-debug.apk || {
+            echo "ERROR: APK was not generated."
             exit 1
-          fi
+          }
 
-          echo "APK BUILD SUCCESSFUL."
+          echo "AAKNOVA APK BUILD SUCCESSFUL."
 
-      - name: Upload AAKNOVA APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: AAKNOVA-APK
